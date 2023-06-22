@@ -15,6 +15,8 @@
 
 import { first } from 'rxjs/operators';
 import { Observable } from 'rxjs';
+import { parse } from 'url';
+import { merge } from 'lodash';
 import {
   PluginInitializerContext,
   CoreSetup,
@@ -24,6 +26,9 @@ import {
   ILegacyClusterClient,
   SessionStorageFactory,
   SharedGlobalConfig,
+  OpenSearchDashboardsRequest,
+  Capabilities,
+  CapabilitiesSwitcher,
 } from '../../../src/core/server';
 
 import { SecurityPluginSetup, SecurityPluginStart } from './types';
@@ -47,6 +52,7 @@ import { setupMultitenantRoutes } from './multitenancy/routes';
 import { defineAuthTypeRoutes } from './routes/auth_type_routes';
 import { createMigrationOpenSearchClient } from '../../../src/core/server/saved_objects/migrations/core';
 import { SecuritySavedObjectsClientWrapper } from './saved_objects/saved_objects_wrapper';
+import { globalTenantName } from '../common';
 
 export interface SecurityPluginRequestContext {
   logger: Logger;
@@ -82,6 +88,109 @@ export class SecurityPlugin implements Plugin<SecurityPluginSetup, SecurityPlugi
   constructor(private readonly initializerContext: PluginInitializerContext) {
     this.logger = initializerContext.logger.get();
     this.savedObjectClientWrapper = new SecuritySavedObjectsClientWrapper();
+  }
+
+  isAnonymousPage(request: OpenSearchDashboardsRequest) {
+    if (request.headers && request.headers.referer) {
+      try {
+        const { pathname } = parse(request.headers.referer as string);
+        const pathsToIgnore = ['login', 'logout', 'customerror'];
+        if (pathsToIgnore.indexOf(pathname?.split('/').pop() || '') > -1) {
+          return true;
+        }
+      } catch (error: any) {
+        this.logger.error(`Could not parse the referer for the capabilites: ${error.stack}`);
+      }
+    }
+
+    return false;
+  }
+
+  isReadOnlyTenant(authInfo: any) {
+    // global tenant is ''
+    const currentTenant = authInfo.user_requested_tenant || globalTenantName;
+
+    if (currentTenant === '__user__') {
+      // private tenant is not affected
+      return false;
+    }
+
+    const isReadOnlyTenant = authInfo.tenants[currentTenant] !== true ? true : false;
+
+    return isReadOnlyTenant;
+  }
+
+  toggleReadOnlyCapabilities(capabilities: any): Partial<Capabilities> {
+    return Object.entries(capabilities).reduce((acc, cur) => {
+      const [key, value] = cur;
+
+      return { ...acc, [key]: capabilities.hide_for_read_only.includes(key) ? false : value };
+    }, {});
+  }
+
+  toggleForReadOnlyTenant(uiCapabilities: Capabilities) {
+    const defaultTenantOnlyCapabilities = Object.entries(uiCapabilities).reduce((acc, cur) => {
+      const [key, value] = cur;
+
+      if (!value.hide_for_read_only) {
+        return acc;
+      }
+
+      const updatedValue = this.toggleReadOnlyCapabilities(value);
+
+      return { ...acc, [key]: updatedValue };
+    }, {});
+
+    const finalCapabilities = merge(uiCapabilities, defaultTenantOnlyCapabilities);
+
+    return finalCapabilities;
+  }
+
+  capabilitiesSwitcher(
+    securityClient: SecurityClient,
+    auth: IAuthenticationType,
+    securitySessionStorageFactory: SessionStorageFactory<SecuritySessionCookie>
+  ): CapabilitiesSwitcher {
+    return async (
+      request: OpenSearchDashboardsRequest,
+      uiCapabilities: Capabilities
+    ): Promise<Partial<Capabilities>> => {
+      // omit for anonymous pages to avoid authentication errors
+      if (this.isAnonymousPage(request)) {
+        return uiCapabilities;
+      }
+
+      try {
+        let headers = request.headers;
+
+        if (!auth.requestIncludesAuthInfo(request)) {
+          const cookie = await securitySessionStorageFactory.asScoped(request).get();
+          // @ts-ignore
+          headers = auth.buildAuthHeaderFromCookie(cookie, request);
+        }
+
+        const authInfo = await securityClient.authinfo(request, headers);
+
+        if (this.isReadOnlyTenant(authInfo)) {
+          return this.toggleForReadOnlyTenant(uiCapabilities);
+        }
+      } catch (error: any) {
+        this.logger.error(`Could not check auth info: ${error.stack}`);
+      }
+
+      return uiCapabilities;
+    };
+  }
+
+  registerSwitcher(
+    core: CoreSetup,
+    securityClient: SecurityClient,
+    auth: IAuthenticationType,
+    securitySessionStorageFactory: SessionStorageFactory<SecuritySessionCookie>
+  ) {
+    core.capabilities.registerSwitcher(
+      this.capabilitiesSwitcher(securityClient, auth, securitySessionStorageFactory)
+    );
   }
 
   public async setup(core: CoreSetup) {
@@ -131,6 +240,9 @@ export class SecurityPlugin implements Plugin<SecurityPluginSetup, SecurityPlugi
     // set up multi-tenent routes
     if (config.multitenancy?.enabled) {
       setupMultitenantRoutes(router, securitySessionStorageFactory, this.securityClient);
+
+      const securityClient: SecurityClient = this.securityClient;
+      this.registerSwitcher(core, securityClient, auth, securitySessionStorageFactory);
     }
 
     if (config.multitenancy.enabled && config.multitenancy.enable_aggregation_view) {
