@@ -15,7 +15,6 @@
 
 import { first } from 'rxjs/operators';
 import { Observable } from 'rxjs';
-import { parse } from 'url';
 import { merge } from 'lodash';
 import {
   PluginInitializerContext,
@@ -49,7 +48,7 @@ import { setupMultitenantRoutes } from './multitenancy/routes';
 import { defineAuthTypeRoutes } from './routes/auth_type_routes';
 import { createMigrationOpenSearchClient } from '../../../src/core/server/saved_objects/migrations/core';
 import { SecuritySavedObjectsClientWrapper } from './saved_objects/saved_objects_wrapper';
-import { globalTenantName } from '../common';
+import { globalTenantName, isPrivateTenant } from '../common';
 import { addTenantParameterToResolvedShortLink } from './multitenancy/tenant_resolver';
 
 export interface SecurityPluginRequestContext {
@@ -89,33 +88,28 @@ export class SecurityPlugin implements Plugin<SecurityPluginSetup, SecurityPlugi
   }
 
   isAnonymousPage(request: OpenSearchDashboardsRequest) {
-    if (request.headers && request.headers.referer) {
-      try {
-        const { pathname } = parse(request.headers.referer as string);
-        const pathsToIgnore = ['login', 'logout', 'customerror'];
-        if (pathsToIgnore.indexOf(pathname?.split('/').pop() || '') > -1) {
-          return true;
-        }
-      } catch (error: any) {
-        this.logger.error(`Could not parse the referer for the capabilites: ${error.stack}`);
-      }
-    }
-
-    return false;
-  }
-
-  isReadOnlyTenant(authInfo: any) {
-    // global tenant is ''
-    const currentTenant = authInfo.user_requested_tenant || globalTenantName;
-
-    if (currentTenant === '__user__') {
-      // private tenant is not affected
+    if (!request.headers || !request.headers.referer) {
       return false;
     }
 
-    const isReadOnlyTenant = authInfo.tenants[currentTenant] !== true ? true : false;
+    try {
+      const url = new URL(request.headers.referer as string);
+      const pathsToIgnore = ['login', 'logout', 'customerror'];
+      return pathsToIgnore.includes(url.pathname?.split('/').pop() || '');
+    } catch (error: any) {
+      this.logger.error(`Could not parse the referer for the 1: ${error.stack}`);
+    }
+  }
 
-    return isReadOnlyTenant;
+  isReadOnlyTenant(authInfo: any): boolean {
+    const currentTenant = authInfo.user_requested_tenant || globalTenantName;
+
+    // private tenant is not affected
+    if (isPrivateTenant(currentTenant)) {
+      return false;
+    }
+
+    return authInfo.tenants[currentTenant] !== true;
   }
 
   toggleReadOnlyCapabilities(capabilities: any): Partial<Capabilities> {
@@ -126,7 +120,7 @@ export class SecurityPlugin implements Plugin<SecurityPluginSetup, SecurityPlugi
     }, {});
   }
 
-  toggleForReadOnlyTenant(uiCapabilities: Capabilities) {
+  toggleForReadOnlyTenant(uiCapabilities: Capabilities): Partial<Capabilities> {
     const defaultTenantOnlyCapabilities = Object.entries(uiCapabilities).reduce((acc, cur) => {
       const [key, value] = cur;
 
@@ -159,15 +153,18 @@ export class SecurityPlugin implements Plugin<SecurityPluginSetup, SecurityPlugi
       }
 
       try {
+        const cookie = await securitySessionStorageFactory.asScoped(request).get();
         let headers = request.headers;
 
-        if (!auth.requestIncludesAuthInfo(request)) {
-          const cookie = await securitySessionStorageFactory.asScoped(request).get();
-          // @ts-ignore
+        if (!auth.requestIncludesAuthInfo(request) && cookie) {
           headers = auth.buildAuthHeaderFromCookie(cookie, request);
         }
 
         const authInfo = await securityClient.authinfo(request, headers);
+
+        if (!authInfo.user_requested_tenant && cookie) {
+          authInfo.user_requested_tenant = cookie.tenant;
+        }
 
         if (this.isReadOnlyTenant(authInfo)) {
           return this.toggleForReadOnlyTenant(uiCapabilities);
